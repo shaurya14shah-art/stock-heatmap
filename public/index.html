@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>US Stock Heatmap</title>
+<style>
+  :root { --bg:#0f1218; --panel:#171b23; --line:#0f1218; --text:#e8ebf0; --mute:#8b93a1; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.3 -apple-system,BlinkMacSystemFont,"Inter",Segoe UI,sans-serif; }
+  body { display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:14px; padding:10px 14px; background:var(--panel); border-bottom:1px solid #232937; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:.2px; }
+  .grp { display:flex; align-items:center; gap:6px; color:var(--mute); }
+  .seg { display:flex; background:#10141b; border:1px solid #2a3140; border-radius:7px; overflow:hidden; }
+  .seg button { background:none; border:0; color:var(--mute); padding:5px 10px; cursor:pointer; font:inherit; }
+  .seg button.on { background:#2a3347; color:var(--text); }
+  input[type=search] { background:#10141b; border:1px solid #2a3140; color:var(--text); padding:5px 9px; border-radius:7px; width:150px; font:inherit; }
+  .spacer { flex:1; }
+  #status { color:var(--mute); font-variant-numeric:tabular-nums; }
+  #legend { display:flex; align-items:center; gap:6px; color:var(--mute); font-size:11px; }
+  #legend i { width:120px; height:8px; border-radius:4px; background:linear-gradient(90deg,#d8362f,#3b2f35 38%,#2f3a44 50%,#2f4a3a 62%,#2fb344); }
+  #map { position:relative; flex:1; overflow:hidden; margin:6px; }
+  .tile { position:absolute; overflow:hidden; border:1px solid var(--line); display:flex; flex-direction:column; align-items:center; justify-content:center;
+          color:#fff; cursor:pointer; text-shadow:0 1px 2px rgba(0,0,0,.55); user-select:none; transition:filter .1s; }
+  .tile:hover { filter:brightness(1.25); z-index:5; outline:2px solid #fff; outline-offset:-2px; }
+  .tile b { font-weight:700; line-height:1.05; }
+  .tile span { opacity:.92; line-height:1.1; font-variant-numeric:tabular-nums; }
+  .tile.dim { opacity:.18; }
+  .sector { position:absolute; border:1px solid #000; background:#000; }
+  .sector > .lbl { position:absolute; left:0; top:0; right:0; height:16px; padding:1px 5px; font-size:10.5px; font-weight:700; letter-spacing:.6px; color:#c9cfdb; text-transform:uppercase; white-space:nowrap; overflow:hidden; background:#000; cursor:pointer; }
+  .sector > .lbl:hover { color:#fff; }
+  #tip { position:fixed; pointer-events:none; z-index:20; background:#1b2030f2; border:1px solid #38425a; border-radius:8px; padding:9px 11px; min-width:190px; display:none; box-shadow:0 6px 24px #0008; }
+  #tip .t { font-weight:700; font-size:14px; } #tip .n { color:var(--mute); margin-bottom:6px; }
+  #tip .r { display:flex; justify-content:space-between; gap:18px; } #tip .r span:first-child { color:var(--mute); }
+  .up { color:#4ade80; } .down { color:#f87171; }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--mute); font-size:15px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>US Stock Heatmap</h1>
+  <div class="grp">Group <div class="seg" id="mode"><button data-v="sector" class="on">Sectors</button><button data-v="flat">All</button></div></div>
+  <div class="grp">Show <div class="seg" id="topn"><button data-v="100">100</button><button data-v="300">300</button><button data-v="600" class="on">600</button><button data-v="1000">1000</button><button data-v="99999">All</button></div></div>
+  <input type="search" id="q" placeholder="Search ticker…">
+  <div class="spacer"></div>
+  <div id="legend">-3% <i></i> +3%</div>
+  <div id="status">Loading…</div>
+</header>
+<div id="map"><div id="msg">Fetching live data…</div></div>
+<div id="tip"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const map = $('#map'), tip = $('#tip');
+let DATA = [], state = { mode: 'sector', topn: 600, q: '', focus: null };
+
+// ---------- colors ----------
+const stops = [ // change% -> color
+  [-3, [216,54,47]], [-1, [128,48,52]], [-0.01, [64,50,58]],
+  [0, [56,62,72]], [0.01, [48,76,62]], [1, [40,116,70]], [3, [47,179,68]] ];
+function color(ch) {
+  if (ch <= stops[0][0]) return `rgb(${stops[0][1]})`;
+  for (let i = 1; i < stops.length; i++) if (ch <= stops[i][0]) {
+    const [a, ca] = stops[i-1], [b, cb] = stops[i], t = (ch - a) / (b - a);
+    return `rgb(${ca.map((v,k)=>Math.round(v+(cb[k]-v)*t)).join(',')})`;
+  }
+  return `rgb(${stops.at(-1)[1]})`;
+}
+
+// ---------- squarified treemap ----------
+function squarify(items, x, y, w, h) { // items: [{value}] sorted desc; sets .x .y .w .h
+  const total = items.reduce((s, i) => s + i.value, 0);
+  if (!total || w <= 0 || h <= 0) return;
+  const scale = (w * h) / total;
+  let i = 0;
+  while (i < items.length) {
+    const side = Math.min(w, h), row = [];
+    let rowArea = 0, best = Infinity;
+    while (i < items.length) {
+      const a = items[i].value * scale, nArea = rowArea + a;
+      const mx = Math.max(...row.map(r => r.value * scale), a), mn = Math.min(...row.map(r => r.value * scale), a);
+      const worst = Math.max((side*side*mx)/(nArea*nArea), (nArea*nArea)/(side*side*mn));
+      if (row.length && worst > best) break;
+      row.push(items[i]); rowArea = nArea; best = worst; i++;
+    }
+    const thick = rowArea / side;
+    let off = 0;
+    for (const r of row) {
+      const len = (r.value * scale) / thick;
+      if (w >= h) { r.x = x; r.y = y + off; r.w = thick; r.h = len; }
+      else { r.x = x + off; r.y = y; r.w = len; r.h = thick; }
+      off += len;
+    }
+    if (w >= h) { x += thick; w -= thick; } else { y += thick; h -= thick; }
+  }
+}
+
+// ---------- render ----------
+const fmtCap = c => c >= 1e12 ? (c/1e12).toFixed(2)+'T' : c >= 1e9 ? (c/1e9).toFixed(1)+'B' : (c/1e6).toFixed(0)+'M';
+const fmtPct = p => (p > 0 ? '+' : '') + p.toFixed(2) + '%';
+
+function tile(s, r) {
+  const d = document.createElement('div');
+  d.className = 'tile';
+  d.style.cssText = `left:${r.x}px;top:${r.y}px;width:${Math.max(r.w,0)}px;height:${Math.max(r.h,0)}px;background:${color(s.ch)}`;
+  const m = Math.min(r.w, r.h);
+  if (m > 22 && r.w > 28) {
+    const fs = Math.max(8, Math.min(m / 3.2, 34, r.w / (s.s.length * 0.72)));
+    d.innerHTML = `<b style="font-size:${fs}px">${s.s}</b>` + (r.h > fs * 2.2 ? `<span style="font-size:${Math.max(8, fs*0.62)}px">${fmtPct(s.ch)}</span>` : '');
+  }
+  d._s = s;
+  if (state.q && !s.s.startsWith(state.q) && !s.n.toUpperCase().includes(state.q)) d.classList.add('dim');
+  return d;
+}
+
+function render() {
+  if (!DATA.length) return;
+  const W = map.clientWidth, H = map.clientHeight;
+  map.innerHTML = '';
+  let stocks = DATA.slice(0, state.topn);
+  if (state.focus) stocks = DATA.filter(s => s.sec === state.focus).slice(0, state.topn);
+  const frag = document.createDocumentFragment();
+
+  if (state.mode === 'flat' || state.focus) {
+    const items = stocks.map(s => ({ s, value: s.c }));
+    squarify(items, 0, 0, W, H);
+    items.forEach(i => frag.appendChild(tile(i.s, i)));
+    if (state.focus) { const b = document.createElement('div'); b.className='sector'; b.style.cssText='left:0;top:0;width:0;height:0'; }
+  } else {
+    const bySec = {};
+    stocks.forEach(s => (bySec[s.sec] ||= []).push(s));
+    const secs = Object.entries(bySec).map(([name, list]) => ({ name, list, value: list.reduce((a, s) => a + s.c, 0) })).sort((a, b) => b.value - a.value);
+    squarify(secs, 0, 0, W, H);
+    for (const sec of secs) {
+      const box = document.createElement('div');
+      box.className = 'sector';
+      box.style.cssText = `left:${sec.x}px;top:${sec.y}px;width:${sec.w}px;height:${sec.h}px`;
+      const lbl = document.createElement('div');
+      lbl.className = 'lbl'; lbl.textContent = sec.name; lbl.title = 'Click to zoom into ' + sec.name;
+      lbl.onclick = () => { state.focus = sec.name; render(); };
+      box.appendChild(lbl);
+      const items = sec.list.map(s => ({ s, value: s.c }));
+      squarify(items, 0, 16, sec.w - 2, sec.h - 18);
+      items.forEach(i => { const t = tile(i.s, i); box.appendChild(t); });
+      frag.appendChild(box);
+    }
+  }
+  map.appendChild(frag);
+  if (state.focus) {
+    const b = document.createElement('button');
+    b.textContent = '← All sectors · ' + state.focus;
+    b.style.cssText = 'position:absolute;right:8px;top:8px;z-index:9;background:#000b;color:#fff;border:1px solid #fff4;border-radius:6px;padding:5px 10px;cursor:pointer';
+    b.onclick = () => { state.focus = null; render(); };
+    map.appendChild(b);
+  }
+}
+
+// ---------- tooltip / click ----------
+map.addEventListener('mousemove', e => {
+  const t = e.target.closest('.tile');
+  if (!t || !t._s) { tip.style.display = 'none'; return; }
+  const s = t._s;
+  tip.innerHTML = `<div class="t">${s.s}</div><div class="n">${s.n} · ${s.sec}</div>
+    <div class="r"><span>Price</span><span>$${s.p?.toFixed(2)}</span></div>
+    <div class="r"><span>Today</span><span class="${s.ch>=0?'up':'down'}">${fmtPct(s.ch)}</span></div>
+    <div class="r"><span>Market cap</span><span>$${fmtCap(s.c)}</span></div>`;
+  tip.style.display = 'block';
+  const x = e.clientX + 16, y = e.clientY + 16;
+  tip.style.left = Math.min(x, innerWidth - tip.offsetWidth - 8) + 'px';
+  tip.style.top = Math.min(y, innerHeight - tip.offsetHeight - 8) + 'px';
+});
+map.addEventListener('mouseleave', () => tip.style.display = 'none');
+map.addEventListener('click', e => { const t = e.target.closest('.tile'); if (t?._s) open('https://finance.yahoo.com/quote/' + encodeURIComponent(t._s.s), '_blank'); });
+
+// ---------- controls ----------
+document.querySelectorAll('.seg').forEach(seg => seg.addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  if (seg.id === 'mode') { state.mode = b.dataset.v; state.focus = null; } else state.topn = +b.dataset.v;
+  render();
+}));
+$('#q').addEventListener('input', e => { state.q = e.target.value.trim().toUpperCase(); render(); });
+addEventListener('resize', () => { clearTimeout(window._rz); window._rz = setTimeout(render, 120); });
+
+// ---------- data ----------
+async function load() {
+  try {
+    const r = await fetch('/api/stocks'); const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    DATA = j.stocks;
+    const adv = DATA.filter(s => s.ch > 0).length, dec = DATA.filter(s => s.ch < 0).length;
+    $('#status').innerHTML = `${DATA.length} stocks · <span class="up">${adv}▲</span> <span class="down">${dec}▼</span> · ${new Date(j.updated).toLocaleTimeString()}`;
+    render();
+  } catch (e) { if (!DATA.length) map.innerHTML = `<div id="msg">Couldn't load data: ${e.message}. Retrying…</div>`; }
+}
+load(); setInterval(load, 60000);
+</script>
+</body>
+</html>
